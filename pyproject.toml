@@ -1,0 +1,15 @@
+[project]
+name = "expense-tracker"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=2.14.0,<3.0",
+    "motor>=3.7.1",
+    "pandas>=2.3.3",
+    "plotly>=6.5.2",
+    "pydantic>=2.12.5",
+    "pymongo>=4.16.0",
+    "python-dotenv>=1.2.1",
+]
