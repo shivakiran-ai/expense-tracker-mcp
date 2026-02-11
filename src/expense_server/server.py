@@ -1,300 +1,465 @@
 """
-Currency conversion utilities
-Uses ExchangeRate-API for real-time rates with caching
+FastMCP Server for Expense Tracker
+Production-ready MCP tools for expense management
 """
 
-import requests
-from typing import Tuple, Optional
-import logging
-from datetime import datetime, timedelta
+import sys
+from pathlib import Path
 
+# Add project root to Python path (CRITICAL FIX!)
+project_root = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(project_root))
+
+from fastmcp import FastMCP
+from datetime import datetime
+import logging
+from typing import Optional
+from bson import ObjectId
+
+# Import Day 1 modules
+from src.expense_server.database.connection import get_database
+from src.expense_server.database.models import (
+    ExpenseCreate,
+    VALID_CATEGORIES,
+    VALID_PAYMENT_METHODS,
+    SUPPORTED_CURRENCIES,
+    CURRENCY_SYMBOLS,
+    CATEGORY_SUBCATEGORIES,
+    get_subcategories_for_category,
+)
+from src.expense_server.utils.currency import (
+    convert_to_usd,
+    format_amount_with_symbol,
+)
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-# Cache exchange rates to reduce API calls
-# Key: "FROM_TO" (e.g., "INR_USD")
-# Value: {"rate": float, "timestamp": datetime}
-_rate_cache = {}
+# Create FastMCP server
+mcp = FastMCP("Expense Tracker")
 
-# Cache expiry: 24 hours
-CACHE_DURATION_HOURS = 24
+# Hardcoded test user for Day 2-5
+TEST_USER_ID = "test_user_123"
 
-# Base currency (everything converted to this)
-BASE_CURRENCY = "USD"
+logger.info("Expense Tracker MCP Server initialized")
+logger.info(f"Test User ID: {TEST_USER_ID}")
 
 
-def get_exchange_rate(from_currency: str, to_currency: str = "USD") -> float:
+# ============================================
+# HELPER FUNCTIONS
+# ============================================
+
+def normalize_subcategory(category: str, subcategory: Optional[str]) -> str:
     """
-    Get exchange rate from one currency to another.
-    Uses ExchangeRate-API with 24-hour caching.
-    
-    Free tier: 1,500 requests/month
-    With caching: Supports many users without hitting limit
+    Normalize subcategory to valid value or default to "other".
+    Simple and clean - no complex logic.
     
     Args:
-        from_currency: Source currency code (e.g., "INR")
-        to_currency: Target currency code (default: "USD")
+        category: Main category
+        subcategory: Subcategory provided by Claude
     
     Returns:
-        Exchange rate (e.g., 1 INR = 0.012 USD returns 0.012)
-    
-    Example:
-        >>> get_exchange_rate("INR", "USD")
-        0.012
-        # Means: 1 INR = 0.012 USD
+        Valid subcategory or "other"
     """
-    # If same currency, no conversion needed
-    if from_currency == to_currency:
-        return 1.0
+    # If no subcategory provided, use "other"
+    if not subcategory:
+        logger.info(f"No subcategory provided, using 'other'")
+        return "other"
     
-    # Check cache first
-    cache_key = f"{from_currency}_{to_currency}"
-    now = datetime.now()
+    # Get valid subcategories for this category
+    valid_subcats = CATEGORY_SUBCATEGORIES.get(category, [])
     
-    if cache_key in _rate_cache:
-        cached_data = _rate_cache[cache_key]
-        cache_age = now - cached_data["timestamp"]
-        
-        # If cache is still valid (less than 24 hours old)
-        if cache_age < timedelta(hours=CACHE_DURATION_HOURS):
-            logger.info(f"Using cached rate for {from_currency} to {to_currency}: {cached_data['rate']}")
-            return cached_data["rate"]
-        else:
-            logger.info(f"Cache expired for {cache_key}, fetching new rate")
+    if not valid_subcats:
+        logger.warning(f"No valid subcategories for category '{category}', using 'other'")
+        return "other"
     
-    # Fetch from API
-    try:
-        # ExchangeRate-API (Free tier: 1,500 requests/month)
-        url = f"https://api.exchangerate-api.com/v4/latest/{from_currency}"
-        
-        logger.info(f"Fetching exchange rate from API: {from_currency} to {to_currency}")
-        
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        
-        data = response.json()
-        
-        # Get rate for target currency
-        if to_currency not in data["rates"]:
-            raise ValueError(f"Currency {to_currency} not found in API response")
-        
-        rate = data["rates"][to_currency]
-        
-        # Cache the rate
-        _rate_cache[cache_key] = {
-            "rate": rate,
-            "timestamp": now
-        }
-        
-        logger.info(f"✅ Fetched exchange rate: 1 {from_currency} = {rate} {to_currency}")
-        
-        return rate
-        
-    except requests.exceptions.RequestException as e:
-        logger.error(f"❌ API request failed: {e}")
-        return _get_fallback_rate(from_currency, to_currency)
+    # Normalize input
+    subcat_lower = subcategory.lower().strip()
     
-    except (KeyError, ValueError) as e:
-        logger.error(f"❌ Failed to parse API response: {e}")
-        return _get_fallback_rate(from_currency, to_currency)
+    # If exact match, use it
+    if subcat_lower in valid_subcats:
+        logger.info(f"Valid subcategory: '{subcat_lower}'")
+        return subcat_lower
     
-    except Exception as e:
-        logger.error(f"❌ Unexpected error getting exchange rate: {e}")
-        return _get_fallback_rate(from_currency, to_currency)
+    # Check if any valid subcategory is contained in the provided one
+    # Example: "doctor visit" contains "doctor"
+    for valid in valid_subcats:
+        if valid in subcat_lower:
+            logger.info(f"Matched '{subcat_lower}' to '{valid}'")
+            return valid
+    
+    # No match found, use "other"
+    logger.info(f"No match for '{subcategory}', using 'other'")
+    return "other"
 
 
-def _get_fallback_rate(from_currency: str, to_currency: str) -> float:
-    """
-    Get fallback/approximate exchange rate when API fails.
-    
-    These are approximate rates updated manually.
-    Should be updated monthly for accuracy.
-    
-    Returns:
-        Approximate exchange rate
-    """
-    # Approximate rates (as of February 2025)
-    # Update these monthly for better accuracy
-    fallback_rates_to_usd = {
-        "INR": 0.012,   # 1 INR ≈ 0.012 USD (₹83.33 = $1)
-        "GBP": 1.27,    # 1 GBP ≈ 1.27 USD
-        "EUR": 1.09,    # 1 EUR ≈ 1.09 USD
-        "AUD": 0.65,    # 1 AUD ≈ 0.65 USD
-        "CAD": 0.74,    # 1 CAD ≈ 0.74 USD
-        "JPY": 0.0067,  # 1 JPY ≈ 0.0067 USD
-        "CNY": 0.14,    # 1 CNY ≈ 0.14 USD
-        "SGD": 0.74,    # 1 SGD ≈ 0.74 USD
-        "AED": 0.27,    # 1 AED ≈ 0.27 USD
-        "USD": 1.0,     # 1 USD = 1 USD
-    }
-    
-    if to_currency == "USD":
-        rate = fallback_rates_to_usd.get(from_currency, 1.0)
-        logger.warning(f"⚠️ Using fallback rate: 1 {from_currency} = {rate} USD")
-        return rate
-    
-    elif from_currency == "USD":
-        # Convert from USD to target
-        usd_rate = fallback_rates_to_usd.get(to_currency, 1.0)
-        rate = 1.0 / usd_rate if usd_rate != 0 else 1.0
-        logger.warning(f"⚠️ Using fallback rate: 1 USD = {rate} {to_currency}")
-        return rate
-    
-    else:
-        # Convert from_currency → USD → to_currency
-        from_to_usd = fallback_rates_to_usd.get(from_currency, 1.0)
-        usd_to_target = 1.0 / fallback_rates_to_usd.get(to_currency, 1.0)
-        rate = from_to_usd * usd_to_target
-        logger.warning(f"⚠️ Using fallback rate: 1 {from_currency} = {rate} {to_currency}")
-        return rate
+# ============================================
+# TOOL 1: ADD EXPENSE
+# ============================================
 
-
-def convert_to_usd(amount: float, from_currency: str) -> Tuple[float, float]:
-    """
-    Convert amount from any currency to USD (base currency).
+@mcp.tool()
+async def add_expense(
+    amount: float,
+    currency: str,
+    category: str,
+    description: str,
+    payment_method: str = "cash",
+    payment_subcategory: Optional[str] = None,
+    subcategory: Optional[str] = None,
+    date: Optional[str] = None
+) -> str:
+    f"""
+    Add a new expense to the tracker.
+    
+    Automatically converts amounts to USD for storage while preserving
+    the original amount and currency for display.
+    
+    CATEGORY INFERENCE - Use keywords from description:
+    
+    "food" keywords: dinner, lunch, breakfast, meal, restaurant, cafe, groceries, supermarket, food, pizza, burger
+    "transport" keywords: gas, fuel, petrol, uber, taxi, cab, bus, train, parking, ride
+    "utilities" keywords: electricity, internet, wifi, phone, water, bill
+    "healthcare" keywords: doctor, hospital, medicine, pharmacy, dentist, clinic, checkup
+    "entertainment" keywords: movie, cinema, netflix, spotify, concert, game
+    "education" keywords: course, book, class, training, tuition, school
+    "shopping" keywords: clothes, electronics, laptop, phone, shirt, gift
+    "housing" keywords: rent, mortgage, repair, furniture
+    "personal" keywords: haircut, salon, gym, spa
+    
+    VALID CATEGORIES:
+    {', '.join(VALID_CATEGORIES)}
+    
+    VALID SUBCATEGORIES BY CATEGORY:
+    Food: {', '.join(CATEGORY_SUBCATEGORIES['food'])}
+    Transport: {', '.join(CATEGORY_SUBCATEGORIES['transport'])}
+    Education: {', '.join(CATEGORY_SUBCATEGORIES['education'])}
+    Entertainment: {', '.join(CATEGORY_SUBCATEGORIES['entertainment'])}
+    Shopping: {', '.join(CATEGORY_SUBCATEGORIES['shopping'])}
+    Utilities: {', '.join(CATEGORY_SUBCATEGORIES['utilities'])}
+    Healthcare: {', '.join(CATEGORY_SUBCATEGORIES['healthcare'])}
+    Housing: {', '.join(CATEGORY_SUBCATEGORIES['housing'])}
+    Personal: {', '.join(CATEGORY_SUBCATEGORIES['personal'])}
+    
+    VALID PAYMENT METHODS:
+    {', '.join(VALID_PAYMENT_METHODS)}
+    
+    SUPPORTED CURRENCIES:
+    {', '.join(SUPPORTED_CURRENCIES)}
+    
+    EXAMPLES:
+    User: "bought groceries for 500 rupees" → category="food", subcategory="groceries"
+    User: "doctor checkup 500 rupees" → category="healthcare", subcategory="doctor"
+    User: "filled gas 2000 rupees using phonepe" → category="transport", subcategory="fuel", payment_method="upi", payment_subcategory="phonepe"
+    User: "movie ticket 400 rupees" → category="entertainment", subcategory="movies"
     
     Args:
         amount: Amount in original currency
-        from_currency: Currency code (e.g., "INR", "GBP")
+        currency: Currency code (INR, USD, GBP, EUR, etc.)
+        category: Main category from valid list
+        description: What the expense was for
+        payment_method: How it was paid (default: cash)
+        payment_subcategory: Specific card/app name (optional)
+        subcategory: Subcategory from valid list (optional)
+        date: Date in YYYY-MM-DD format (defaults to today)
     
     Returns:
-        Tuple of (amount_in_usd, exchange_rate_used)
-    
-    Example:
-        >>> convert_to_usd(150, "INR")
-        (1.80, 0.012)
-        # 150 INR = 1.80 USD at rate 0.012
+        Success message with expense details
     """
-    if from_currency == "USD":
-        return (amount, 1.0)
     
-    # Get current exchange rate
-    rate = get_exchange_rate(from_currency, "USD")
-    
-    # Convert
-    amount_usd = amount * rate
-    
-    # Round to 2 decimal places (cents)
-    amount_usd = round(amount_usd, 2)
-    
-    logger.info(f"💱 Converted {amount} {from_currency} → ${amount_usd} USD (rate: {rate})")
-    
-    return (amount_usd, rate)
-
-
-def convert_from_usd(amount_usd: float, to_currency: str) -> float:
-    """
-    Convert amount from USD to another currency (for display).
-    
-    Args:
-        amount_usd: Amount in USD
-        to_currency: Target currency code
-    
-    Returns:
-        Amount in target currency
-    
-    Example:
-        >>> convert_from_usd(1.80, "INR")
-        150.0
-        # $1.80 USD = 150 INR
-    """
-    if to_currency == "USD":
-        return amount_usd
-    
-    # Get rate from USD to target currency
-    rate = get_exchange_rate("USD", to_currency)
-    
-    # Convert
-    amount_target = amount_usd * rate
-    
-    # Round to 2 decimal places
-    amount_target = round(amount_target, 2)
-    
-    logger.info(f"💱 Converted ${amount_usd} USD → {amount_target} {to_currency} (rate: {rate})")
-    
-    return amount_target
-
-
-def get_all_rates_for_currency(base_currency: str) -> dict:
-    """
-    Get exchange rates from base currency to all other currencies.
-    Useful for displaying converted amounts in multiple currencies.
-    
-    Args:
-        base_currency: Base currency code
-    
-    Returns:
-        Dictionary of {currency_code: rate}
-    
-    Example:
-        >>> get_all_rates_for_currency("USD")
-        {"INR": 83.33, "GBP": 0.79, "EUR": 0.92, ...}
-    """
     try:
-        url = f"https://api.exchangerate-api.com/v4/latest/{base_currency}"
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
+        logger.info(f"Adding expense: {amount} {currency} for {description}")
         
-        data = response.json()
-        return data["rates"]
+        # Use hardcoded test user
+        user_id = TEST_USER_ID
+        
+        # Convert currency to USD
+        logger.info(f"Converting {amount} {currency} to USD...")
+        amount_usd, exchange_rate = convert_to_usd(amount, currency)
+        logger.info(f"Converted: {amount} {currency} = ${amount_usd} USD (rate: {exchange_rate})")
+        
+        # Parse date if provided
+        expense_date = datetime.now()
+        if date:
+            try:
+                expense_date = datetime.strptime(date, "%Y-%m-%d")
+                logger.info(f"Using provided date: {date}")
+            except ValueError:
+                logger.warning(f"Invalid date format '{date}', using today")
+        
+        # Normalize subcategory
+        normalized_subcategory = normalize_subcategory(category, subcategory)
+        
+        # Create expense data
+        expense_data = {
+            "user_id": user_id,
+            "amount": amount_usd,
+            "original_amount": amount,
+            "original_currency": currency,
+            "user_currency": currency,
+            "exchange_rate": exchange_rate,
+            "category": category,
+            "subcategory": normalized_subcategory,
+            "description": description,
+            "date": expense_date,
+            "payment_method": payment_method,
+            "payment_subcategory": payment_subcategory,
+        }
+        
+        logger.info("Validating expense data...")
+        
+        # Validate with Pydantic
+        expense = ExpenseCreate(**expense_data)
+        logger.info("Validation passed")
+        
+        # Save to database
+        logger.info("Saving to database...")
+        db = await get_database()
+        result = await db.expenses.insert_one(expense.model_dump())
+        
+        expense_id = str(result.inserted_id)
+        logger.info(f"Saved successfully with ID: {expense_id}")
+        
+        # Format success message
+        symbol = CURRENCY_SYMBOLS.get(currency, currency)
+        formatted_amount = format_amount_with_symbol(amount, currency)
+        
+        success_message = (
+            f"Expense added successfully!\n\n"
+            f"Amount: {formatted_amount}\n"
+            f"Category: {category}"
+        )
+        
+        if normalized_subcategory:
+            success_message += f" > {normalized_subcategory}"
+        
+        success_message += f"\nDescription: {description}"
+        success_message += f"\nPayment: {payment_method}"
+        
+        if payment_subcategory:
+            success_message += f" ({payment_subcategory})"
+        
+        success_message += f"\nStored as: ${amount_usd} USD"
+        
+        if exchange_rate != 1.0:
+            success_message += f"\nExchange rate: 1 {currency} = {exchange_rate} USD"
+        
+        logger.info("Expense added successfully")
+        return success_message
         
     except Exception as e:
-        logger.error(f"Failed to get all rates: {e}")
-        return {}
+        error_msg = f"Failed to add expense: {str(e)}"
+        logger.error(error_msg)
+        logger.exception("Full error details:")
+        return error_msg
 
 
-def format_amount_with_symbol(amount: float, currency_code: str) -> str:
+# ============================================
+# TOOL 2: GET EXPENSES
+# ============================================
+
+@mcp.tool()
+async def get_expenses(
+    limit: int = 10,
+    category: Optional[str] = None
+) -> str:
     """
-    Format amount with currency symbol.
+    Get recent expenses for the user.
+    
+    Returns a formatted list of expenses with all details needed for
+    the user to review their spending.
     
     Args:
-        amount: Amount to format
-        currency_code: Currency code
+        limit: Maximum number of expenses to return (default: 10, max: 50)
+        category: Filter by category (optional)
     
     Returns:
-        Formatted string with symbol
+        Formatted list of expenses with descriptions, amounts, categories, and dates
+    """
     
-    Example:
-        >>> format_amount_with_symbol(150, "INR")
-        "₹150.00"
-        >>> format_amount_with_symbol(20, "USD")
-        "$20.00"
+    try:
+        logger.info(f"Getting expenses (limit: {limit}, category: {category})")
+        
+        # Validate limit
+        if limit > 50:
+            limit = 50
+        if limit < 1:
+            limit = 10
+        
+        # Use hardcoded test user
+        user_id = TEST_USER_ID
+        
+        # Build query
+        query = {"user_id": user_id}
+        if category:
+            query["category"] = category.lower()
+        
+        # Get expenses from database
+        db = await get_database()
+        expenses = await db.expenses.find(query).sort("date", -1).limit(limit).to_list(length=limit)
+        
+        if not expenses:
+            if category:
+                return f"No expenses found in category '{category}'"
+            return "No expenses found. Add your first expense to get started!"
+        
+        logger.info(f"Found {len(expenses)} expenses")
+        
+        # Format output
+        if category:
+            result = f"Your {category.title()} Expenses ({len(expenses)}):\n\n"
+        else:
+            result = f"Your Recent Expenses ({len(expenses)}):\n\n"
+        
+        total_usd = 0
+        
+        for i, exp in enumerate(expenses, 1):
+            # Get original amount and currency
+            orig_amount = exp.get('original_amount', exp['amount'])
+            orig_currency = exp.get('original_currency', 'USD')
+            symbol = CURRENCY_SYMBOLS.get(orig_currency, orig_currency)
+            
+            # Format date
+            exp_date = exp.get('date', datetime.now())
+            if isinstance(exp_date, datetime):
+                date_str = exp_date.strftime("%b %d, %Y")
+            else:
+                date_str = str(exp_date)[:10]
+            
+            # Build expense line
+            result += f"{i}. {exp['description']} - {symbol}{orig_amount:.2f}\n"
+            result += f"   Category: {exp['category']}"
+            
+            if exp.get('subcategory'):
+                result += f" > {exp['subcategory']}"
+            
+            result += f"\n   Payment: {exp['payment_method']}"
+            
+            if exp.get('payment_subcategory'):
+                result += f" ({exp['payment_subcategory']})"
+            
+            result += f"\n   Date: {date_str}\n\n"
+            
+            # Add to total
+            total_usd += exp['amount']
+        
+        # Add total
+        result += f"Total: ${total_usd:.2f} USD"
+        
+        if category:
+            result += f" ({category} expenses)"
+        
+        return result
+        
+    except Exception as e:
+        error_msg = f"Failed to get expenses: {str(e)}"
+        logger.error(error_msg)
+        logger.exception("Full error details:")
+        return error_msg
+
+
+# ============================================
+# TOOL 3: DELETE EXPENSE
+# ============================================
+
+@mcp.tool()
+async def delete_expense(
+    description: str
+) -> str:
     """
-    from src.expense_server.database.models import CURRENCY_SYMBOLS
+    Delete an expense by its description.
     
-    symbol = CURRENCY_SYMBOLS.get(currency_code.upper(), currency_code)
-    return f"{symbol}{amount:.2f}"
-
-
-def clear_cache():
-    """
-    Clear the exchange rate cache.
-    Useful for testing or manual refresh.
-    """
-    global _rate_cache
-    _rate_cache = {}
-    logger.info("🗑️ Exchange rate cache cleared")
-
-
-def get_cache_info() -> dict:
-    """
-    Get information about cached exchange rates.
-    Useful for debugging and monitoring.
+    Searches for an expense matching the description and deletes it.
+    If multiple expenses match, shows a list and asks user to be more specific.
+    
+    Args:
+        description: Description of the expense to delete (e.g., "pizza", "coffee", "uber")
+    
+    Examples:
+        User: "delete the pizza expense" → description="pizza"
+        User: "remove coffee" → description="coffee"
+        User: "delete my uber ride" → description="uber"
     
     Returns:
-        Dictionary with cache statistics
+        Success message with deleted expense details, or error if not found
     """
-    now = datetime.now()
-    cache_info = {
-        "total_cached": len(_rate_cache),
-        "rates": {}
-    }
     
-    for key, data in _rate_cache.items():
-        age = now - data["timestamp"]
-        cache_info["rates"][key] = {
-            "rate": data["rate"],
-            "age_hours": age.total_seconds() / 3600,
-            "expires_in_hours": CACHE_DURATION_HOURS - (age.total_seconds() / 3600)
-        }
-    
-    return cache_info
+    try:
+        logger.info(f"Deleting expense with description: {description}")
+        
+        # Use hardcoded test user
+        user_id = TEST_USER_ID
+        
+        db = await get_database()
+        
+        # Find expenses matching description (case-insensitive)
+        expenses = await db.expenses.find({
+            "user_id": user_id,
+            "description": {"$regex": description, "$options": "i"}
+        }).to_list(length=10)
+        
+        # No matches found
+        if not expenses:
+            logger.info(f"No expenses found matching '{description}'")
+            return f"No expense found matching '{description}'. Please check the description and try again."
+        
+        # Multiple matches found
+        if len(expenses) > 1:
+            logger.info(f"Multiple expenses found matching '{description}'")
+            
+            result = f"Multiple expenses found matching '{description}':\n\n"
+            
+            for i, exp in enumerate(expenses, 1):
+                orig_amount = exp.get('original_amount', exp['amount'])
+                orig_currency = exp.get('original_currency', 'USD')
+                symbol = CURRENCY_SYMBOLS.get(orig_currency, orig_currency)
+                
+                exp_date = exp.get('date', datetime.now())
+                if isinstance(exp_date, datetime):
+                    date_str = exp_date.strftime("%b %d, %Y")
+                else:
+                    date_str = str(exp_date)[:10]
+                
+                result += f"{i}. {exp['description']} - {symbol}{orig_amount:.2f}\n"
+                result += f"   Category: {exp['category']} | Date: {date_str}\n\n"
+            
+            result += "Please be more specific about which expense to delete."
+            return result
+        
+        # Exact match found - delete it
+        expense = expenses[0]
+        
+        # Get details before deleting
+        orig_amount = expense.get('original_amount', expense['amount'])
+        orig_currency = expense.get('original_currency', 'USD')
+        symbol = CURRENCY_SYMBOLS.get(orig_currency, orig_currency)
+        category = expense['category']
+        desc = expense['description']
+        
+        # Delete the expense
+        result = await db.expenses.delete_one({"_id": expense["_id"]})
+        
+        if result.deleted_count > 0:
+            logger.info(f"Successfully deleted expense: {desc}")
+            return f"Deleted expense: {desc} ({symbol}{orig_amount:.2f}) from {category}"
+        else:
+            logger.error(f"Failed to delete expense: {desc}")
+            return f"Failed to delete expense. Please try again."
+        
+    except Exception as e:
+        error_msg = f"Failed to delete expense: {str(e)}"
+        logger.error(error_msg)
+        logger.exception("Full error details:")
+        return error_msg
+
+
+# ============================================
+# ENTRY POINT
+# ============================================
+
+if __name__ == "__main__":
+    logger.info("Starting Expense Tracker MCP Server...")
+    mcp.run()
