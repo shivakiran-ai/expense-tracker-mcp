@@ -6,7 +6,7 @@ Production-ready MCP tools for expense management
 import sys
 from pathlib import Path
 
-# Add project root to Python path (CRITICAL FIX!)
+# Add project root to Python path
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
@@ -16,7 +16,7 @@ import logging
 from typing import Optional
 from bson import ObjectId
 
-# Import Day 1 modules
+# Import database modules
 from src.expense_server.database.connection import get_database
 from src.expense_server.database.models import (
     ExpenseCreate,
@@ -25,11 +25,18 @@ from src.expense_server.database.models import (
     SUPPORTED_CURRENCIES,
     CURRENCY_SYMBOLS,
     CATEGORY_SUBCATEGORIES,
-    get_subcategories_for_category,
 )
+
+# Import utility modules
 from src.expense_server.utils.currency import (
     convert_to_usd,
     format_amount_with_symbol,
+)
+from src.expense_server.utils.validators import (
+    validate_and_fix_category,
+    infer_subcategory_from_description,
+    normalize_payment_method,
+    infer_payment_subcategory,
 )
 
 # Setup logging
@@ -50,54 +57,6 @@ logger.info(f"Test User ID: {TEST_USER_ID}")
 
 
 # ============================================
-# HELPER FUNCTIONS
-# ============================================
-
-def normalize_subcategory(category: str, subcategory: Optional[str]) -> str:
-    """
-    Normalize subcategory to valid value or default to "other".
-    Simple and clean - no complex logic.
-    
-    Args:
-        category: Main category
-        subcategory: Subcategory provided by Claude
-    
-    Returns:
-        Valid subcategory or "other"
-    """
-    # If no subcategory provided, use "other"
-    if not subcategory:
-        logger.info(f"No subcategory provided, using 'other'")
-        return "other"
-    
-    # Get valid subcategories for this category
-    valid_subcats = CATEGORY_SUBCATEGORIES.get(category, [])
-    
-    if not valid_subcats:
-        logger.warning(f"No valid subcategories for category '{category}', using 'other'")
-        return "other"
-    
-    # Normalize input
-    subcat_lower = subcategory.lower().strip()
-    
-    # If exact match, use it
-    if subcat_lower in valid_subcats:
-        logger.info(f"Valid subcategory: '{subcat_lower}'")
-        return subcat_lower
-    
-    # Check if any valid subcategory is contained in the provided one
-    # Example: "doctor visit" contains "doctor"
-    for valid in valid_subcats:
-        if valid in subcat_lower:
-            logger.info(f"Matched '{subcat_lower}' to '{valid}'")
-            return valid
-    
-    # No match found, use "other"
-    logger.info(f"No match for '{subcategory}', using 'other'")
-    return "other"
-
-
-# ============================================
 # TOOL 1: ADD EXPENSE
 # ============================================
 
@@ -115,55 +74,48 @@ async def add_expense(
     f"""
     Add a new expense to the tracker.
     
-    Automatically converts amounts to USD for storage while preserving
-    the original amount and currency for display.
-    
-    CATEGORY INFERENCE - Use keywords from description:
-    
-    "food" keywords: dinner, lunch, breakfast, meal, restaurant, cafe, groceries, supermarket, food, pizza, burger
-    "transport" keywords: gas, fuel, petrol, uber, taxi, cab, bus, train, parking, ride
-    "utilities" keywords: electricity, internet, wifi, phone, water, bill
-    "healthcare" keywords: doctor, hospital, medicine, pharmacy, dentist, clinic, checkup
-    "entertainment" keywords: movie, cinema, netflix, spotify, concert, game
-    "education" keywords: course, book, class, training, tuition, school
-    "shopping" keywords: clothes, electronics, laptop, phone, shirt, gift
-    "housing" keywords: rent, mortgage, repair, furniture
-    "personal" keywords: haircut, salon, gym, spa
+    Converts amounts to USD for storage while preserving original currency.
     
     VALID CATEGORIES:
     {', '.join(VALID_CATEGORIES)}
     
-    VALID SUBCATEGORIES BY CATEGORY:
-    Food: {', '.join(CATEGORY_SUBCATEGORIES['food'])}
-    Transport: {', '.join(CATEGORY_SUBCATEGORIES['transport'])}
-    Education: {', '.join(CATEGORY_SUBCATEGORIES['education'])}
-    Entertainment: {', '.join(CATEGORY_SUBCATEGORIES['entertainment'])}
-    Shopping: {', '.join(CATEGORY_SUBCATEGORIES['shopping'])}
-    Utilities: {', '.join(CATEGORY_SUBCATEGORIES['utilities'])}
-    Healthcare: {', '.join(CATEGORY_SUBCATEGORIES['healthcare'])}
-    Housing: {', '.join(CATEGORY_SUBCATEGORIES['housing'])}
-    Personal: {', '.join(CATEGORY_SUBCATEGORIES['personal'])}
+    Category inference keywords:
+    - food: groceries, restaurant, coffee, pizza, burger, meal, lunch, dinner
+    - transport: fuel, gas, taxi, uber, bus, train, parking, ride
+    - healthcare: doctor, hospital, medicine, pharmacy, dentist, checkup
+    - utilities: electricity, internet, water, phone, bill
+    - entertainment: movie, netflix, game, concert, music
+    - education: book, course, tuition, school, class
+    - shopping: clothes, laptop, electronics, gift, shopping
+    - housing: rent, mortgage, furniture, repair
+    - personal: haircut, gym, spa, salon, fitness
     
     VALID PAYMENT METHODS:
     {', '.join(VALID_PAYMENT_METHODS)}
     
+    Payment method keywords:
+    - "gpay", "google pay" -> payment_method="upi"
+    - "phonepe" -> payment_method="upi"
+    - "paytm" -> payment_method="upi"
+    - "card" -> payment_method="credit_card"
+    - "cash" -> payment_method="cash"
+    
     SUPPORTED CURRENCIES:
     {', '.join(SUPPORTED_CURRENCIES)}
     
-    EXAMPLES:
-    User: "bought groceries for 500 rupees" → category="food", subcategory="groceries"
-    User: "doctor checkup 500 rupees" → category="healthcare", subcategory="doctor"
-    User: "filled gas 2000 rupees using phonepe" → category="transport", subcategory="fuel", payment_method="upi", payment_subcategory="phonepe"
-    User: "movie ticket 400 rupees" → category="entertainment", subcategory="movies"
+    Examples:
+    "Bought groceries 800 rupees" -> category="food", description="Bought groceries"
+    "Doctor checkup 500 rupees paid by gpay" -> category="healthcare", payment_method="upi"
+    "Filled fuel 2000 rupees" -> category="transport", description="Filled fuel"
     
     Args:
         amount: Amount in original currency
-        currency: Currency code (INR, USD, GBP, EUR, etc.)
-        category: Main category from valid list
+        currency: Currency code (INR, USD, EUR, GBP)
+        category: Main category
         description: What the expense was for
         payment_method: How it was paid (default: cash)
-        payment_subcategory: Specific card/app name (optional)
-        subcategory: Subcategory from valid list (optional)
+        payment_subcategory: Specific app/card (optional)
+        subcategory: Specific type (optional, auto-inferred)
         date: Date in YYYY-MM-DD format (defaults to today)
     
     Returns:
@@ -172,11 +124,36 @@ async def add_expense(
     
     try:
         logger.info(f"Adding expense: {amount} {currency} for {description}")
+        logger.info(f"Received - category: '{category}', payment_method: '{payment_method}'")
         
         # Use hardcoded test user
         user_id = TEST_USER_ID
         
-        # Convert currency to USD
+        # Store original payment method before normalization
+        original_payment_method = payment_method
+        
+        # Validate and fix category using validator utility
+        validated_category = validate_and_fix_category(category, description)
+        if validated_category != category.lower():
+            logger.info(f"Category corrected: '{category}' -> '{validated_category}'")
+        
+        # Normalize payment method using validator utility
+        normalized_payment_method = normalize_payment_method(payment_method)
+        
+        # Infer subcategory from description using validator utility
+        inferred_subcategory = infer_subcategory_from_description(validated_category, description)
+        
+        # Infer payment subcategory using validator utility
+        inferred_payment_subcategory = infer_payment_subcategory(
+            normalized_payment_method,
+            original_payment_method,
+            description
+        )
+        
+        logger.info(f"Final values - category: '{validated_category}', subcategory: '{inferred_subcategory}'")
+        logger.info(f"Final payment - method: '{normalized_payment_method}', subcategory: '{inferred_payment_subcategory}'")
+        
+        # Convert currency to USD using currency utility
         logger.info(f"Converting {amount} {currency} to USD...")
         amount_usd, exchange_rate = convert_to_usd(amount, currency)
         logger.info(f"Converted: {amount} {currency} = ${amount_usd} USD (rate: {exchange_rate})")
@@ -190,10 +167,7 @@ async def add_expense(
             except ValueError:
                 logger.warning(f"Invalid date format '{date}', using today")
         
-        # Normalize subcategory
-        normalized_subcategory = normalize_subcategory(category, subcategory)
-        
-        # Create expense data
+        # Create expense data with validated/inferred values
         expense_data = {
             "user_id": user_id,
             "amount": amount_usd,
@@ -201,12 +175,12 @@ async def add_expense(
             "original_currency": currency,
             "user_currency": currency,
             "exchange_rate": exchange_rate,
-            "category": category,
-            "subcategory": normalized_subcategory,
+            "category": validated_category,
+            "subcategory": inferred_subcategory,
             "description": description,
             "date": expense_date,
-            "payment_method": payment_method,
-            "payment_subcategory": payment_subcategory,
+            "payment_method": normalized_payment_method,
+            "payment_subcategory": inferred_payment_subcategory,
         }
         
         logger.info("Validating expense data...")
@@ -230,17 +204,17 @@ async def add_expense(
         success_message = (
             f"Expense added successfully!\n\n"
             f"Amount: {formatted_amount}\n"
-            f"Category: {category}"
+            f"Category: {validated_category}"
         )
         
-        if normalized_subcategory:
-            success_message += f" > {normalized_subcategory}"
+        if inferred_subcategory:
+            success_message += f" > {inferred_subcategory}"
         
         success_message += f"\nDescription: {description}"
-        success_message += f"\nPayment: {payment_method}"
+        success_message += f"\nPayment: {normalized_payment_method}"
         
-        if payment_subcategory:
-            success_message += f" ({payment_subcategory})"
+        if inferred_payment_subcategory:
+            success_message += f" ({inferred_payment_subcategory})"
         
         success_message += f"\nStored as: ${amount_usd} USD"
         
@@ -267,17 +241,46 @@ async def get_expenses(
     category: Optional[str] = None
 ) -> str:
     """
-    Get recent expenses for the user.
+    Get recent expenses for the user with detailed formatting.
     
-    Returns a formatted list of expenses with all details needed for
-    the user to review their spending.
+    Use this tool when the user asks to:
+    - "show my expenses"
+    - "list my expenses"
+    - "what did I spend"
+    - "show my recent expenses"
+    - "get my food expenses" (with category filter)
+    - "show last 5 expenses" (with limit)
+    
+    This tool returns a formatted list with:
+    - Description and amount in original currency
+    - Category and subcategory breakdown
+    - Payment method details
+    - Date information
+    - Total amount in USD
     
     Args:
         limit: Maximum number of expenses to return (default: 10, max: 50)
-        category: Filter by category (optional)
+               Use this when user says "last 5 expenses" or "show 20 expenses"
+        
+        category: Filter by specific category (optional, lowercase)
+                  Valid categories: food, transport, healthcare, utilities, 
+                  entertainment, education, shopping, housing, personal
+                  Use this when user says "show food expenses" or "healthcare spending"
     
     Returns:
-        Formatted list of expenses with descriptions, amounts, categories, and dates
+        Formatted string with expense details including:
+        - Numbered list of expenses
+        - Original amount with currency symbol
+        - Category > subcategory
+        - Payment method (with subcategory if applicable)
+        - Date in readable format
+        - Total in USD
+    
+    Examples:
+        get_expenses(limit=10) - Show last 10 expenses
+        get_expenses(limit=5) - Show last 5 expenses
+        get_expenses(category="food") - Show all food expenses
+        get_expenses(limit=3, category="healthcare") - Show last 3 healthcare expenses
     """
     
     try:
@@ -372,19 +375,11 @@ async def delete_expense(
     """
     Delete an expense by its description.
     
-    Searches for an expense matching the description and deletes it.
-    If multiple expenses match, shows a list and asks user to be more specific.
-    
     Args:
-        description: Description of the expense to delete (e.g., "pizza", "coffee", "uber")
-    
-    Examples:
-        User: "delete the pizza expense" → description="pizza"
-        User: "remove coffee" → description="coffee"
-        User: "delete my uber ride" → description="uber"
+        description: Description of the expense to delete
     
     Returns:
-        Success message with deleted expense details, or error if not found
+        Success message or error
     """
     
     try:
@@ -463,3 +458,6 @@ async def delete_expense(
 if __name__ == "__main__":
     logger.info("Starting Expense Tracker MCP Server...")
     mcp.run()
+
+
+
