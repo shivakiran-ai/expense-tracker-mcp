@@ -363,7 +363,6 @@ async def get_expenses(
         logger.exception("Full error details:")
         return error_msg
 
-
 # ============================================
 # TOOL 3: DELETE EXPENSE
 # ============================================
@@ -373,13 +372,35 @@ async def delete_expense(
     description: str
 ) -> str:
     """
-    Delete an expense by its description.
+    Delete an expense by its description using fuzzy matching.
+    
+    Use this tool when the user asks to:
+    - "delete the gym expense"
+    - "remove the coffee purchase"
+    - "delete my last groceries"
+    - "remove the movie ticket"
+    
+    This tool uses case-insensitive partial matching, so:
+    - "gym" will match "Gym membership"
+    - "coffee" will match "Coffee at Starbucks"
+    - "groceries" will match "Groceries" or "Bought groceries"
+    
+    If multiple expenses match, the tool will list all matches
+    and ask the user to be more specific.
     
     Args:
-        description: Description of the expense to delete
+        description: Part of or full description of the expense to delete
+                    (case-insensitive, partial matches supported)
     
     Returns:
-        Success message or error
+        Success message with deleted expense details, OR
+        List of matching expenses if multiple found, OR
+        Error message if no matches found
+    
+    Examples:
+        delete_expense("gym") - Deletes gym membership if only one found
+        delete_expense("coffee") - Deletes coffee expense
+        delete_expense("groceries") - Lists all if multiple, deletes if one
     """
     
     try:
@@ -449,7 +470,195 @@ async def delete_expense(
         logger.error(error_msg)
         logger.exception("Full error details:")
         return error_msg
+# ============================================
+# TOOL 4: UPDATE EXPENSE
+# ============================================
 
+@mcp.tool()
+async def update_expense(
+    description: str,
+    new_amount: Optional[float] = None,
+    new_currency: Optional[str] = None,
+    new_category: Optional[str] = None,
+    new_description: Optional[str] = None,
+    new_payment_method: Optional[str] = None,
+    new_date: Optional[str] = None
+) -> str:
+    """
+    Update an existing expense by finding it with its description.
+    
+    Use this tool when the user asks to:
+    - "change the groceries amount to 900"
+    - "update the restaurant expense to food category"
+    - "fix the movie ticket payment to card"
+    - "change doctor checkup description"
+    
+    At least one field must be provided to update. The tool will:
+    1. Find the expense by description (fuzzy matching)
+    2. Update the specified fields
+    3. Recalculate USD amount if amount/currency changed
+    4. Re-validate category if changed
+    
+    Args:
+        description: Description of the expense to update (required, fuzzy match)
+        new_amount: New amount in original currency (optional)
+        new_currency: New currency code (optional)
+        new_category: New category (optional, will be validated)
+        new_description: New description text (optional)
+        new_payment_method: New payment method (optional, will be normalized)
+        new_date: New date in YYYY-MM-DD format (optional)
+    
+    Returns:
+        Success message with updated details, OR
+        List of matching expenses if multiple found, OR
+        Error message if no match or no updates provided
+    
+    Examples:
+        update_expense("groceries", new_amount=900) - Change amount to 900
+        update_expense("movie", new_payment_method="card") - Change payment
+        update_expense("doctor", new_category="healthcare") - Fix category
+    """
+    
+    try:
+        logger.info(f"Updating expense with description: {description}")
+        
+        # Validate at least one update field is provided
+        if not any([new_amount, new_currency, new_category, new_description, 
+                   new_payment_method, new_date]):
+            return "No updates provided. Please specify at least one field to update."
+        
+        # Use hardcoded test user
+        user_id = TEST_USER_ID
+        
+        db = await get_database()
+        
+        # Find expenses matching description (case-insensitive)
+        expenses = await db.expenses.find({
+            "user_id": user_id,
+            "description": {"$regex": description, "$options": "i"}
+        }).to_list(length=10)
+        
+        # No matches found
+        if not expenses:
+            logger.info(f"No expenses found matching '{description}'")
+            return f"No expense found matching '{description}'. Please check the description and try again."
+        
+        # Multiple matches found
+        if len(expenses) > 1:
+            logger.info(f"Multiple expenses found matching '{description}'")
+            
+            result = f"Multiple expenses found matching '{description}':\n\n"
+            
+            for i, exp in enumerate(expenses, 1):
+                orig_amount = exp.get('original_amount', exp['amount'])
+                orig_currency = exp.get('original_currency', 'USD')
+                symbol = CURRENCY_SYMBOLS.get(orig_currency, orig_currency)
+                
+                exp_date = exp.get('date', datetime.now())
+                if isinstance(exp_date, datetime):
+                    date_str = exp_date.strftime("%b %d, %Y")
+                else:
+                    date_str = str(exp_date)[:10]
+                
+                result += f"{i}. {exp['description']} - {symbol}{orig_amount:.2f}\n"
+                result += f"   Category: {exp['category']} | Date: {date_str}\n\n"
+            
+            result += "Please be more specific about which expense to update."
+            return result
+        
+        # Single match found - update it
+        expense = expenses[0]
+        expense_id = expense["_id"]
+        
+        # Build update document
+        update_doc = {}
+        changes_summary = []
+        
+        # Update amount and/or currency (requires USD recalculation)
+        if new_amount is not None or new_currency is not None:
+            amount = new_amount if new_amount is not None else expense.get('original_amount', expense['amount'])
+            currency = new_currency if new_currency is not None else expense.get('original_currency', 'USD')
+            
+            # Convert to USD
+            amount_usd, exchange_rate = convert_to_usd(amount, currency)
+            
+            update_doc["amount"] = amount_usd
+            update_doc["original_amount"] = amount
+            update_doc["original_currency"] = currency
+            update_doc["exchange_rate"] = exchange_rate
+            
+            symbol = CURRENCY_SYMBOLS.get(currency, currency)
+            changes_summary.append(f"Amount: {symbol}{amount:.2f}")
+        
+        # Update category (validate and infer subcategory)
+        if new_category is not None:
+            validated_category = validate_and_fix_category(new_category, expense['description'])
+            inferred_subcategory = infer_subcategory_from_description(
+                validated_category, 
+                expense['description']
+            )
+            
+            update_doc["category"] = validated_category
+            update_doc["subcategory"] = inferred_subcategory
+            
+            changes_summary.append(f"Category: {validated_category}")
+            if inferred_subcategory:
+                changes_summary.append(f"Subcategory: {inferred_subcategory}")
+        
+        # Update description
+        if new_description is not None:
+            update_doc["description"] = new_description
+            changes_summary.append(f"Description: {new_description}")
+        
+        # Update payment method (normalize)
+        if new_payment_method is not None:
+            normalized_payment = normalize_payment_method(new_payment_method)
+            inferred_payment_subcat = infer_payment_subcategory(
+                normalized_payment,
+                new_payment_method,
+                expense['description']
+            )
+            
+            update_doc["payment_method"] = normalized_payment
+            update_doc["payment_subcategory"] = inferred_payment_subcat
+            
+            changes_summary.append(f"Payment: {normalized_payment}")
+            if inferred_payment_subcat:
+                changes_summary.append(f"Payment subcategory: {inferred_payment_subcat}")
+        
+        # Update date
+        if new_date is not None:
+            try:
+                expense_date = datetime.strptime(new_date, "%Y-%m-%d")
+                update_doc["date"] = expense_date
+                changes_summary.append(f"Date: {new_date}")
+            except ValueError:
+                logger.warning(f"Invalid date format '{new_date}', skipping date update")
+        
+        # Perform the update
+        result = await db.expenses.update_one(
+            {"_id": expense_id},
+            {"$set": update_doc}
+        )
+        
+        if result.modified_count > 0:
+            logger.info(f"Successfully updated expense: {expense['description']}")
+            
+            response = f"Updated expense: {expense['description']}\n\n"
+            response += "Changes made:\n"
+            for change in changes_summary:
+                response += f"  • {change}\n"
+            
+            return response
+        else:
+            logger.warning(f"No changes made to expense: {expense['description']}")
+            return f"No changes were made. The expense may already have these values."
+        
+    except Exception as e:
+        error_msg = f"Failed to update expense: {str(e)}"
+        logger.error(error_msg)
+        logger.exception("Full error details:")
+        return error_msg
 
 # ============================================
 # ENTRY POINT
